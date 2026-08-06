@@ -10,20 +10,41 @@ for _stream in (sys.stdout, sys.stderr):
         try: _stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception: pass
 
+# Set BEFORE the imports below: admin and daemon both read BU_NAME at import
+# time, and the daemon inherits this process's environment.
+#
+# A daemon holds ONE attached tab for everyone talking to it. Two agents sharing
+# a BU_NAME therefore share a browser AND that single tab, so one agent's
+# switch_tab silently moves the other's page out from under it, mid-run.
+# Defaulting the name to the agent's own session gives each its own daemon,
+# browser and profile, so they cannot reach each other at all.
+#
+# Pass BU_NAME explicitly to opt back in to a shared browser -- that is how you
+# reach a profile you logged into once (see login_background_profile).
+if not os.environ.get("BU_NAME"):
+    for _var in ("CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID", "BH_SESSION_ID"):
+        if _session := os.environ.get(_var):
+            os.environ["BU_NAME"] = "s" + "".join(c for c in _session if c.isalnum())[:8]
+            break
+
 from .admin import (
     _version,
     NAME,
+    background_profile_dir,
     daemon_alive,
     daemon_browser_kind,
     ensure_daemon,
     list_cloud_profiles,
     list_local_profiles,
+    login_background_profile,
     print_update_banner,
     restart_daemon,
     run_doctor,
     run_doctor_fix_snap,
     run_update,
+    start_background_daemon,
     start_remote_daemon,
+    stop_background_daemon,
     stop_remote_daemon,
     sync_local_profile,
 )
@@ -40,7 +61,15 @@ Typical usage:
   print(page_info())
   PY
 
-Helpers are pre-imported. The daemon auto-starts and connects to the running browser.
+Helpers are pre-imported. The daemon auto-starts against its own headless Chrome
+-- separate profile, no window, no focus taken from whatever you are doing.
+
+Each agent session gets its own browser by default, so two agents running at once
+cannot move each other's tab.
+
+  BU_ATTACH=1   drive the browser you are already using instead (takes focus)
+  BU_NAME=x     share a named browser + profile -- how you reach one you logged
+                into once with login_background_profile()
 
 Commands:
   browser-harness --version        print the installed version
@@ -367,8 +396,13 @@ def _run(args):
     # is not enough, since the key is commonly set for unrelated reasons (profile sync,
     # cloud API calls, parent agents managing their own session). An explicit BU_CDP_URL
     # or BU_CDP_WS also blocks the spawn so we honour the precedence install.md promises.
-    cloud_admin = code.lstrip().startswith(("start_remote_daemon(", "stop_remote_daemon("))
-    if not cloud_admin:
+    # A script that manages its own daemon must not have one auto-started under it.
+    admin_call = code.lstrip().startswith((
+        "start_remote_daemon(", "stop_remote_daemon(",
+        "start_background_daemon(", "stop_background_daemon(", "login_background_profile(",
+    ))
+    if not admin_call:
+        spawned_remote = False
         if (
             not daemon_alive()
             and not _local_chrome_listening()
@@ -377,8 +411,18 @@ def _run(args):
             and os.environ.get("BU_AUTOSPAWN")
         ):
             start_remote_daemon(NAME)
+            spawned_remote = True
         try:
-            ensure_daemon()
+            if daemon_alive():
+                pass  # reuse whatever is already attached
+            elif spawned_remote or os.environ.get("BU_ATTACH") or _explicit_cdp_configured():
+                # A cloud browser we just provisioned, an explicit CDP endpoint,
+                # or BU_ATTACH=1 to drive the browser the user is already using.
+                # BU_ATTACH takes focus -- Target.createTarget raises Chrome by
+                # itself, before any activateTarget -- so it is never the default.
+                ensure_daemon()
+            else:
+                start_background_daemon(NAME)
         except RuntimeError as e:
             # Setup/permission errors are instructions for calling agent
             print(f"browser-harness: {e}", file=sys.stderr)

@@ -428,6 +428,177 @@ def ensure_daemon(wait=60.0, name=None, env=None):
         raise RuntimeError(msg or f"daemon {name or NAME} didn't come up -- check {ipc.log_path(name or NAME)}")
 
 
+CHROME_BINARIES = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+]
+
+
+def _chrome_binary():
+    for key in ("BH_CHROME_PATH", "CHROME_PATH"):
+        raw = (os.environ.get(key) or "").strip()
+        if raw and Path(raw).expanduser().is_file():
+            return str(Path(raw).expanduser())
+    for p in CHROME_BINARIES:
+        if Path(p).exists():
+            return p
+    raise RuntimeError(
+        f"no Chrome binary found in {CHROME_BINARIES} -- set BH_CHROME_PATH, or pass chrome=<path>"
+    )
+
+
+def background_profile_dir(name=None):
+    """Chrome profile for a background browser. Persistent, so cookies you log in
+    with once via login_background_profile() are still there on the next run."""
+    return paths.home_dir() / f"chrome-{name or NAME}"
+
+
+def _launch_chrome(name, headless=True, chrome=None, window="1920,1080", args=None):
+    """Launch our own Chrome on its own profile. Returns (pid, ws_url).
+
+    Never hardcode --remote-debugging-port: a taken port makes Chrome log
+    'bind() failed' and run with NO debug port at all, and the caller then
+    attaches to whatever else owns that port -- in practice, a real browser
+    someone is working in. Port 0 makes Chrome pick a free one and write it to
+    DevToolsActivePort *in this profile dir*, so the port read back is provably
+    ours."""
+    d = paths.ensure_private_dir(background_profile_dir(name))
+    _kill_chrome(name)  # a live Chrome on this dir would swallow our flags
+    port_file = d / "DevToolsActivePort"
+    port_file.unlink(missing_ok=True)  # never read a stale port
+
+    argv = [chrome or _chrome_binary()]
+    if headless:
+        argv.append("--headless=new")
+    argv += [
+        "--remote-debugging-port=0",
+        f"--user-data-dir={d}",
+        f"--window-size={window}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        # Headless sets navigator.webdriver=true; the browser a user drives by
+        # hand does not. Keep the two consistent so a site that worked while
+        # attached doesn't start failing because the harness moved to the
+        # background.
+        "--disable-blink-features=AutomationControlled",
+        *(args or []),
+        "about:blank",
+    ]
+    with open(d / "chrome.log", "w") as chrome_log:
+        p = subprocess.Popen(argv, stdout=chrome_log, stderr=subprocess.STDOUT, **ipc.spawn_kwargs())
+    # "manual" marks a visible window a user is logging in through, so the reaper
+    # below never closes it out from under them.
+    (d / "chrome.pid").write_text(str(p.pid) if headless else f"{p.pid} manual")
+    _reap_orphan_chromes(keep=name)
+
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        try:
+            port, path = port_file.read_text(encoding="utf-8").strip().split("\n", 1)
+            return p.pid, f"ws://127.0.0.1:{port.strip()}{path.strip()}"
+        except (FileNotFoundError, ValueError):
+            if p.poll() is not None:
+                break
+            time.sleep(0.2)
+    raise RuntimeError(f"Chrome didn't publish a debug port -- check {d / 'chrome.log'}")
+
+
+def _reap_orphan_chromes(keep=None):
+    """Kill background Chromes whose daemon is gone.
+
+    Names default to the agent's session, so a browser is left behind every time
+    a session ends without stopping its daemon -- and nothing else ever reaps
+    them. Unchecked this reached 9 browsers holding 3GB on one machine. Sweeping
+    at launch bounds the count by the sessions actually running.
+
+    Skips profiles marked "manual": a visible login window has no daemon by
+    design, and closing it mid-login is exactly what the user did not ask for."""
+    for d in sorted(paths.home_dir().glob("chrome-*")):
+        name = d.name[len("chrome-"):]
+        if not name or name == keep or not (d / "chrome.pid").exists():
+            continue
+        try:
+            if "manual" in (d / "chrome.pid").read_text():
+                continue
+        except OSError:
+            continue
+        if daemon_alive(name):
+            continue
+        _kill_chrome(name)
+
+
+def _kill_chrome(name=None):
+    """SIGTERM the Chrome we launched for this profile, if it's still up."""
+    import signal
+
+    f = background_profile_dir(name) / "chrome.pid"
+    try:
+        pid = int(f.read_text().split()[0])
+    except (FileNotFoundError, ValueError, IndexError, OSError):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(50):
+            os.kill(pid, 0)
+            time.sleep(0.1)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    f.unlink(missing_ok=True)
+
+
+def start_background_daemon(name=None, **launch_kwargs):
+    """Headless Chrome on its own profile, driven by a daemon. The default.
+
+    Never touches the browser you are using: separate process, separate profile,
+    separate cookie jar, no window, no Dock icon, no focus taken from whatever
+    the user is doing. Every helper (new_tab, click_at_xy, screenshot, ...) works
+    unchanged.
+
+    kwargs forwarded to _launch_chrome: chrome (binary path), window
+    ("1920,1080"), args (extra Chrome flags).
+
+    Starts logged out of everything -- run login_background_profile() once to fix
+    that for a given site."""
+    name = name or NAME
+    if daemon_alive(name):
+        raise RuntimeError(f"daemon {name!r} already alive -- restart_daemon({name!r}) first")
+    pid, ws = _launch_chrome(name, headless=True, **launch_kwargs)
+    ensure_daemon(name=name, env={"BU_NAME": name, "BU_CDP_WS": ws, "BU_CHROME_PID": str(pid)})
+    return {"name": name, "pid": pid, "ws": ws, "profile": str(background_profile_dir(name))}
+
+
+def login_background_profile(name=None, **launch_kwargs):
+    """Open the background profile in a VISIBLE window so the user can log in by hand.
+
+    Cookies persist in the profile, so every later headless run on that profile is
+    already logged in. Chrome allows one process per profile dir, so this stops the
+    background daemon (and its Chrome) first -- call start_background_daemon() again
+    after.
+
+    Pass an explicit name (and reuse it via BU_NAME) so the login survives: the
+    default name is per-session and will not be there next time."""
+    name = name or NAME
+    restart_daemon(name)  # daemon shutdown kills its Chrome, freeing the profile lock
+    _kill_chrome(name)
+    pid, ws = _launch_chrome(name, headless=False, **launch_kwargs)
+    print(f"Visible window open on profile {background_profile_dir(name)}.")
+    print(f"Log into the sites you need, then close the window and run BU_NAME={name} browser-harness again.")
+    return {"pid": pid, "ws": ws, "profile": str(background_profile_dir(name))}
+
+
+def stop_background_daemon(name=None):
+    """Stop the daemon and the headless Chrome behind it."""
+    name = name or NAME
+    restart_daemon(name)
+    _kill_chrome(name)
+
+
 def stop_remote_daemon(name="remote"):
     """Stop a remote daemon and its backing Browser Use cloud browser.
 

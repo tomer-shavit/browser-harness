@@ -87,6 +87,9 @@ PROFILES = profile_dirs()
 INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension://", "about:")
 BU_API = "https://api.browser-use.com/api/v3"
 REMOTE_ID = os.environ.get("BU_BROWSER_ID")
+# PID of the headless Chrome this daemon launched (start_background_daemon).
+# Set so daemon shutdown takes its browser down with it instead of orphaning it.
+CHROME_PID = os.environ.get("BU_CHROME_PID")
 BROWSER_KIND = "cloud" if REMOTE_ID else ("cdp" if (os.environ.get("BU_CDP_WS") or os.environ.get("BU_CDP_URL")) else "local")
 # Chrome 144+ shows a per-connection popup. Keep popup open enough to click.
 LOCAL_HANDSHAKE_TIMEOUT = 45
@@ -306,6 +309,18 @@ def stop_remote():
         log(f"stop_remote failed ({REMOTE_ID}): {e}")
 
 
+def stop_local_chrome():
+    """Kill the headless Chrome this daemon launched (start_background_daemon)."""
+    if not CHROME_PID:
+        return
+    import signal
+    try:
+        os.kill(int(CHROME_PID), signal.SIGTERM)
+        log(f"stopped background chrome {CHROME_PID}")
+    except (ProcessLookupError, PermissionError, ValueError, OSError) as e:
+        log(f"stop_local_chrome ({CHROME_PID}): {e}")
+
+
 def is_real_page(t):
     return t["type"] == "page" and not t.get("url", "").startswith(INTERNAL)
 
@@ -362,6 +377,7 @@ class Daemon:
         self.target_id = None
         self.events = deque(maxlen=BUF)
         self.dialog = None
+        self.ua = None  # set when the browser reports a HeadlessChrome UA
         self.stop = None  # asyncio.Event, set inside start()
 
     async def attach_first_page(self):
@@ -443,6 +459,25 @@ class Daemon:
             except Exception as e:
                 log(f"enable {d} on {session_id}: {e}")
         await asyncio.gather(*(enable_one(d) for d in ("Page", "DOM", "Runtime", "Network")))
+        await self.apply_ua(session_id)
+
+    async def apply_ua(self, session_id):
+        """Headless Chrome announces itself as `HeadlessChrome/<v>` and plenty of
+        sites block that outright. Present the same UA the user's own Chrome sends,
+        so moving the harness to the background doesn't break a working site.
+
+        No-op on an attached or cloud browser, which reports a normal UA."""
+        if not self.ua or not session_id:
+            return
+        try:
+            await asyncio.wait_for(
+                self.cdp.send_raw(
+                    "Emulation.setUserAgentOverride", {"userAgent": self.ua}, session_id=session_id
+                ),
+                timeout=3,
+            )
+        except Exception as e:
+            log(f"ua override on {session_id}: {e}")
 
     async def start(self):
         self.stop = asyncio.Event()
@@ -467,6 +502,13 @@ class Daemon:
                     " -- wait for the user to click Allow, then retry"
                 )
             raise RuntimeError(f"CDP WS handshake failed: {e} -- click Allow in Chrome if prompted, then retry")
+        try:
+            ua = (await self.cdp.send_raw("Browser.getVersion")).get("userAgent", "")
+            if "HeadlessChrome/" in ua:
+                self.ua = ua.replace("HeadlessChrome/", "Chrome/")
+                log(f"UA override: {self.ua}")
+        except Exception as e:
+            log(f"Browser.getVersion: {e}")
         await self.attach_first_page()
         orig = self.cdp._event_registry.handle_event
         mark_js = "if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title"
@@ -639,5 +681,6 @@ if __name__ == "__main__":
         sys.exit(1)
     finally:
         stop_remote()
+        stop_local_chrome()
         try: os.unlink(PID)
         except FileNotFoundError: pass

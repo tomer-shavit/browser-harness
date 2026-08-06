@@ -45,6 +45,8 @@ run `browser-harness recordings disable`. Preserve an existing `(config)` or
 
 ## If Chrome Blocks It
 
+Only applies under `BU_ATTACH=1`, which drives the browser the user is already using. The default headless browser needs no permission at all.
+
 In Chrome:
 
 1. Open `chrome://inspect/#remote-debugging`.
@@ -83,8 +85,8 @@ browser-harness --doctor
 
 Use the output:
 
-- `chrome running` FAIL: ask the user to open Chrome, or use isolated/cloud browser.
-- `daemon alive` FAIL: Chrome remote debugging permission is missing, Chrome is closed, or the CDP endpoint is not reachable.
+- `chrome running` FAIL: only blocks `BU_ATTACH=1`. The default browser launches its own Chrome.
+- `daemon alive` FAIL: no Chrome binary was found (set `BH_CHROME_PATH`), or under `BU_ATTACH=1` the remote debugging permission is missing, Chrome is closed, or the CDP endpoint is not reachable.
 - update available: run `browser-harness --update -y` when you decide to upgrade.
 
 If this still fails, inspect `src/browser_harness/admin.py`, `src/browser_harness/daemon.py`, and `src/browser_harness/_ipc.py`.

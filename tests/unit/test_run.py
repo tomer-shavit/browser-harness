@@ -13,6 +13,7 @@ def test_stdin_executes_code():
 
     with patch.object(sys, "argv", ["browser-harness"]), \
          patch("browser_harness.run.ensure_daemon"), \
+         patch("browser_harness.run.start_background_daemon"), \
          patch("browser_harness.run.print_update_banner"), \
          patch("sys.stdin", fake_stdin), \
          patch("sys.stdout", stdout):
@@ -67,6 +68,7 @@ def test_cloud_bootstrap_on_headless_server(monkeypatch):
          patch("browser_harness.run._local_chrome_listening", return_value=False), \
          patch("browser_harness.run.start_remote_daemon") as mock_start, \
          patch("browser_harness.run.ensure_daemon"), \
+         patch("browser_harness.run.start_background_daemon"), \
          patch("browser_harness.run.print_update_banner"):
         run.main()
     mock_start.assert_called_once()
@@ -86,6 +88,7 @@ def test_explicit_bu_cdp_url_blocks_cloud_bootstrap(monkeypatch):
          patch("browser_harness.run._local_chrome_listening", return_value=False), \
          patch("browser_harness.run.start_remote_daemon") as mock_start, \
          patch("browser_harness.run.ensure_daemon"), \
+         patch("browser_harness.run.start_background_daemon"), \
          patch("browser_harness.run.print_update_banner"):
         run.main()
     mock_start.assert_not_called()
@@ -104,6 +107,7 @@ def test_explicit_bu_cdp_ws_blocks_cloud_bootstrap(monkeypatch):
          patch("browser_harness.run._local_chrome_listening", return_value=False), \
          patch("browser_harness.run.start_remote_daemon") as mock_start, \
          patch("browser_harness.run.ensure_daemon"), \
+         patch("browser_harness.run.start_background_daemon"), \
          patch("browser_harness.run.print_update_banner"):
         run.main()
     mock_start.assert_not_called()
@@ -122,6 +126,7 @@ def test_empty_bu_cdp_url_does_not_block_bootstrap(monkeypatch):
          patch("browser_harness.run._local_chrome_listening", return_value=False), \
          patch("browser_harness.run.start_remote_daemon") as mock_start, \
          patch("browser_harness.run.ensure_daemon"), \
+         patch("browser_harness.run.start_background_daemon"), \
          patch("browser_harness.run.print_update_banner"):
         run.main()
     mock_start.assert_called_once()
@@ -136,6 +141,7 @@ def test_bad_stored_cloud_auth_does_not_bootstrap_or_crash(monkeypatch):
          patch("browser_harness.run.auth.get_browser_use_api_key", side_effect=run.auth.AuthError("auth file is not valid JSON")), \
          patch("browser_harness.run.start_remote_daemon") as mock_start, \
          patch("browser_harness.run.ensure_daemon"), \
+         patch("browser_harness.run.start_background_daemon"), \
          patch("browser_harness.run.print_update_banner"):
         run.main()
 
@@ -156,6 +162,7 @@ def test_both_bu_cdp_url_and_bu_cdp_ws_set_blocks_bootstrap(monkeypatch):
          patch("browser_harness.run._local_chrome_listening", return_value=False), \
          patch("browser_harness.run.start_remote_daemon") as mock_start, \
          patch("browser_harness.run.ensure_daemon"), \
+         patch("browser_harness.run.start_background_daemon"), \
          patch("browser_harness.run.print_update_banner"):
         run.main()
     mock_start.assert_not_called()
@@ -174,6 +181,7 @@ def test_explicit_endpoint_does_not_break_daemon_alive_short_circuit(monkeypatch
          patch("browser_harness.run._local_chrome_listening", return_value=False), \
          patch("browser_harness.run.start_remote_daemon") as mock_start, \
          patch("browser_harness.run.ensure_daemon"), \
+         patch("browser_harness.run.start_background_daemon"), \
          patch("browser_harness.run.print_update_banner"):
         run.main()
     mock_start.assert_not_called()
@@ -193,6 +201,7 @@ def test_explicit_endpoint_does_not_break_local_chrome_short_circuit(monkeypatch
          patch("browser_harness.run._local_chrome_listening", return_value=True), \
          patch("browser_harness.run.start_remote_daemon") as mock_start, \
          patch("browser_harness.run.ensure_daemon"), \
+         patch("browser_harness.run.start_background_daemon"), \
          patch("browser_harness.run.print_update_banner"):
         run.main()
     mock_start.assert_not_called()
@@ -252,3 +261,82 @@ def test_cli_doctor_rejects_unknown_flags():
             run.main()
     assert ei.value.code == 2
     assert "usage" in err.getvalue().lower()
+
+
+def _fallback_run(monkeypatch, env=None, daemon_alive=False):
+    """Run a trivial script and report which connection path it took."""
+    for k, v in (env or {}).items():
+        monkeypatch.setenv(k, v)
+    with patch.object(sys, "argv", ["browser-harness"]), \
+         patch("sys.stdin", StringIO("x = 1")), \
+         patch("browser_harness.run.daemon_alive", return_value=daemon_alive), \
+         patch("browser_harness.run._local_chrome_listening", return_value=False), \
+         patch("browser_harness.run._cloud_auth_configured", return_value=False), \
+         patch("browser_harness.run.start_remote_daemon") as remote, \
+         patch("browser_harness.run.ensure_daemon") as attach, \
+         patch("browser_harness.run.start_background_daemon") as background, \
+         patch("browser_harness.run.print_update_banner"):
+        run.main()
+    return {"remote": remote, "attach": attach, "background": background}
+
+
+def test_default_launches_background_browser(monkeypatch):
+    """Nothing configured -> our own headless Chrome, never the user's browser.
+
+    Attaching to the running Chrome takes focus: Target.createTarget raises it by
+    itself, before any activateTarget."""
+    calls = _fallback_run(monkeypatch)
+    calls["background"].assert_called_once()
+    calls["attach"].assert_not_called()
+
+
+def test_bu_attach_opts_back_in_to_the_users_browser(monkeypatch):
+    calls = _fallback_run(monkeypatch, {"BU_ATTACH": "1"})
+    calls["attach"].assert_called_once()
+    calls["background"].assert_not_called()
+
+
+@pytest.mark.parametrize("var", ["BU_CDP_URL", "BU_CDP_WS"])
+def test_explicit_endpoint_is_not_overridden_by_a_background_browser(monkeypatch, var):
+    """An explicit endpoint is the user being deliberate. Launching our own Chrome
+    instead would silently ignore it."""
+    calls = _fallback_run(monkeypatch, {var: "http://127.0.0.1:9333"})
+    calls["attach"].assert_called_once()
+    calls["background"].assert_not_called()
+
+
+def test_live_daemon_is_reused(monkeypatch):
+    calls = _fallback_run(monkeypatch, daemon_alive=True)
+    calls["background"].assert_not_called()
+    calls["attach"].assert_not_called()
+
+
+def test_cloud_spawn_does_not_also_launch_local_chrome(monkeypatch):
+    """After provisioning a cloud browser the daemon is not alive yet, so the
+    fallback must not read that as "nothing configured" and launch Chrome here."""
+    monkeypatch.setenv("BROWSER_USE_API_KEY", "test-key")
+    monkeypatch.setenv("BU_AUTOSPAWN", "1")
+    with patch.object(sys, "argv", ["browser-harness"]), \
+         patch("sys.stdin", StringIO("x = 1")), \
+         patch("browser_harness.run.daemon_alive", return_value=False), \
+         patch("browser_harness.run._local_chrome_listening", return_value=False), \
+         patch("browser_harness.run.start_remote_daemon") as remote, \
+         patch("browser_harness.run.ensure_daemon"), \
+         patch("browser_harness.run.start_background_daemon") as background, \
+         patch("browser_harness.run.print_update_banner"):
+        run.main()
+    remote.assert_called_once()
+    background.assert_not_called()
+
+
+def test_managing_a_daemon_by_hand_does_not_auto_start_one(monkeypatch):
+    """A script whose whole job is to start a browser must not get one first."""
+    with patch.object(sys, "argv", ["browser-harness"]), \
+         patch("sys.stdin", StringIO('start_background_daemon("work")')), \
+         patch("browser_harness.run.daemon_alive", return_value=False), \
+         patch("browser_harness.run.start_background_daemon") as background, \
+         patch("browser_harness.run.ensure_daemon") as attach, \
+         patch("browser_harness.run.print_update_banner"):
+        run.main()
+    attach.assert_not_called()
+    background.assert_called_once_with("work")

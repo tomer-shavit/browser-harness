@@ -674,3 +674,66 @@ def test_process_start_time_returns_none_for_invalid_pid():
         )
     # 2**31 - 1 is the largest pid_t; in practice no live process at that PID.
     assert admin._process_start_time((1 << 31) - 1) is None
+
+
+def _profile(tmp_path, name, pid_text):
+    d = tmp_path / f"chrome-{name}"
+    d.mkdir()
+    (d / "chrome.pid").write_text(pid_text)
+    return d
+
+
+def test_reaper_kills_browsers_whose_daemon_is_gone(tmp_path, monkeypatch):
+    """Per-session names leave a browser behind every session; without this sweep
+    they accumulate until the machine runs out of memory."""
+    monkeypatch.setattr(admin.paths, "home_dir", lambda: tmp_path)
+    monkeypatch.setattr(admin, "daemon_alive", lambda name: False)
+    killed = []
+    monkeypatch.setattr(admin, "_kill_chrome", killed.append)
+    _profile(tmp_path, "dead-one", "111")
+    _profile(tmp_path, "dead-two", "222")
+
+    admin._reap_orphan_chromes()
+
+    assert sorted(killed) == ["dead-one", "dead-two"]
+
+
+def test_reaper_spares_live_daemons_and_the_browser_being_launched(tmp_path, monkeypatch):
+    monkeypatch.setattr(admin.paths, "home_dir", lambda: tmp_path)
+    monkeypatch.setattr(admin, "daemon_alive", lambda name: name == "busy")
+    killed = []
+    monkeypatch.setattr(admin, "_kill_chrome", killed.append)
+    _profile(tmp_path, "busy", "111")
+    _profile(tmp_path, "mine", "222")
+    _profile(tmp_path, "stale", "333")
+
+    admin._reap_orphan_chromes(keep="mine")
+
+    assert killed == ["stale"]
+
+
+def test_reaper_never_closes_a_login_window(tmp_path, monkeypatch):
+    """login_background_profile opens a VISIBLE window with no daemon behind it.
+    Reaping on daemon-absence alone would close it while the user is typing."""
+    monkeypatch.setattr(admin.paths, "home_dir", lambda: tmp_path)
+    monkeypatch.setattr(admin, "daemon_alive", lambda name: False)
+    killed = []
+    monkeypatch.setattr(admin, "_kill_chrome", killed.append)
+    _profile(tmp_path, "work", "444 manual")
+
+    admin._reap_orphan_chromes()
+
+    assert killed == []
+
+
+def test_kill_chrome_reads_the_pid_from_a_manual_marker(tmp_path, monkeypatch):
+    """The 'manual' suffix must not make the pid unparseable — stop_background_daemon
+    still has to be able to close a login window on request."""
+    monkeypatch.setattr(admin.paths, "home_dir", lambda: tmp_path)
+    _profile(tmp_path, "work", "4242 manual")
+    signalled = []
+    monkeypatch.setattr(admin.os, "kill", lambda pid, sig: signalled.append(pid) or (_ for _ in ()).throw(ProcessLookupError()))
+
+    admin._kill_chrome("work")
+
+    assert signalled == [4242]
