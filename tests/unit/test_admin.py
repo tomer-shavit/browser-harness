@@ -683,15 +683,21 @@ def _profile(tmp_path, name, pid_text):
     return d
 
 
+def _live(monkeypatch, fingerprint="start-1"):
+    """Make every recorded pid look like it is still the process we launched."""
+    monkeypatch.setattr(admin, "_process_start_time", lambda pid: fingerprint)
+
+
 def test_reaper_kills_browsers_whose_daemon_is_gone(tmp_path, monkeypatch):
     """Per-session names leave a browser behind every session; without this sweep
     they accumulate until the machine runs out of memory."""
     monkeypatch.setattr(admin.paths, "home_dir", lambda: tmp_path)
+    _live(monkeypatch)
     monkeypatch.setattr(admin, "daemon_alive", lambda name: False)
     killed = []
     monkeypatch.setattr(admin, "_kill_chrome", killed.append)
-    _profile(tmp_path, "dead-one", "111")
-    _profile(tmp_path, "dead-two", "222")
+    _profile(tmp_path, "dead-one", "111\nstart-1\n")
+    _profile(tmp_path, "dead-two", "222\nstart-1\n")
 
     admin._reap_orphan_chromes()
 
@@ -700,12 +706,13 @@ def test_reaper_kills_browsers_whose_daemon_is_gone(tmp_path, monkeypatch):
 
 def test_reaper_spares_live_daemons_and_the_browser_being_launched(tmp_path, monkeypatch):
     monkeypatch.setattr(admin.paths, "home_dir", lambda: tmp_path)
+    _live(monkeypatch)
     monkeypatch.setattr(admin, "daemon_alive", lambda name: name == "busy")
     killed = []
     monkeypatch.setattr(admin, "_kill_chrome", killed.append)
-    _profile(tmp_path, "busy", "111")
-    _profile(tmp_path, "mine", "222")
-    _profile(tmp_path, "stale", "333")
+    _profile(tmp_path, "busy", "111\nstart-1\n")
+    _profile(tmp_path, "mine", "222\nstart-1\n")
+    _profile(tmp_path, "stale", "333\nstart-1\n")
 
     admin._reap_orphan_chromes(keep="mine")
 
@@ -716,10 +723,11 @@ def test_reaper_never_closes_a_login_window(tmp_path, monkeypatch):
     """login_background_profile opens a VISIBLE window with no daemon behind it.
     Reaping on daemon-absence alone would close it while the user is typing."""
     monkeypatch.setattr(admin.paths, "home_dir", lambda: tmp_path)
+    _live(monkeypatch)
     monkeypatch.setattr(admin, "daemon_alive", lambda name: False)
     killed = []
     monkeypatch.setattr(admin, "_kill_chrome", killed.append)
-    _profile(tmp_path, "work", "444 manual")
+    _profile(tmp_path, "work", "444 manual\nstart-1\n")
 
     admin._reap_orphan_chromes()
 
@@ -730,10 +738,83 @@ def test_kill_chrome_reads_the_pid_from_a_manual_marker(tmp_path, monkeypatch):
     """The 'manual' suffix must not make the pid unparseable — stop_background_daemon
     still has to be able to close a login window on request."""
     monkeypatch.setattr(admin.paths, "home_dir", lambda: tmp_path)
-    _profile(tmp_path, "work", "4242 manual")
+    _live(monkeypatch)
+    _profile(tmp_path, "work", "4242 manual\nstart-1\n")
     signalled = []
     monkeypatch.setattr(admin.os, "kill", lambda pid, sig: signalled.append(pid) or (_ for _ in ()).throw(ProcessLookupError()))
 
     admin._kill_chrome("work")
 
     assert signalled == [4242]
+
+
+def test_a_reused_pid_is_never_signalled(tmp_path, monkeypatch):
+    """Chrome dies, the OS hands its PID to something unrelated, and the stale
+    pid file still points at it. Killing on the pid alone shoots that process."""
+    monkeypatch.setattr(admin.paths, "home_dir", lambda: tmp_path)
+    monkeypatch.setattr(admin, "_process_start_time", lambda pid: "a-different-process")
+    _profile(tmp_path, "work", "4242\nstart-1\n")
+    signalled = []
+    monkeypatch.setattr(admin.os, "kill", lambda pid, sig: signalled.append(pid))
+
+    admin._kill_chrome("work")
+
+    assert signalled == []
+    assert not (tmp_path / "chrome-work" / "chrome.pid").exists()
+
+
+def test_reaper_skips_a_reused_pid(tmp_path, monkeypatch):
+    monkeypatch.setattr(admin.paths, "home_dir", lambda: tmp_path)
+    monkeypatch.setattr(admin, "_process_start_time", lambda pid: "a-different-process")
+    monkeypatch.setattr(admin, "daemon_alive", lambda name: False)
+    killed = []
+    monkeypatch.setattr(admin, "_kill_chrome", killed.append)
+    _profile(tmp_path, "ghost", "111\nstart-1\n")
+
+    admin._reap_orphan_chromes()
+
+    assert killed == []
+
+
+def test_reaper_stands_down_when_it_cannot_see_other_daemons(tmp_path, monkeypatch):
+    """With a private BH_RUNTIME_DIR, daemon_alive() can only see our own daemon.
+    Every other agent's browser would look dead and get killed mid-run."""
+    monkeypatch.setattr(admin.paths, "home_dir", lambda: tmp_path)
+    _live(monkeypatch)
+    monkeypatch.setattr(admin.ipc, "BH_RUNTIME_DIR", "/tmp/private-runtime")
+    monkeypatch.setattr(admin.ipc, "BH_RUNTIME_DIR_SHARED", False)
+    monkeypatch.setattr(admin, "daemon_alive", lambda name: False)
+    killed = []
+    monkeypatch.setattr(admin, "_kill_chrome", killed.append)
+    _profile(tmp_path, "someone-else", "111\nstart-1\n")
+
+    admin._reap_orphan_chromes()
+
+    assert killed == []
+
+
+def test_kill_escalates_to_sigkill(tmp_path, monkeypatch):
+    """A Chrome that ignores SIGTERM would otherwise be orphaned forever, since
+    the pid file it could be found by is deleted straight after."""
+    import signal
+    monkeypatch.setattr(admin.paths, "home_dir", lambda: tmp_path)
+    _live(monkeypatch)
+    _profile(tmp_path, "stubborn", "4242\nstart-1\n")
+    sent = []
+    monkeypatch.setattr(admin.os, "kill", lambda pid, sig: sent.append(sig))
+    monkeypatch.setattr(admin, "_process_gone", lambda pid: False)
+    monkeypatch.setattr(admin.time, "sleep", lambda s: None)
+
+    admin._kill_chrome("stubborn")
+
+    assert sent == [signal.SIGTERM, signal.SIGKILL]
+
+
+def test_liveness_probe_does_not_kill_on_windows(monkeypatch):
+    """os.kill on Windows terminates the process for any signal that is not a
+    console event, so the POSIX 'signal 0 just asks' idiom would be a kill."""
+    monkeypatch.setattr(admin.os, "name", "nt")
+    monkeypatch.setattr(admin, "_process_start_time", lambda pid: None)
+    monkeypatch.setattr(admin.os, "kill", lambda pid, sig: pytest.fail("os.kill used as a probe on Windows"))
+
+    assert admin._process_gone(4242) is True

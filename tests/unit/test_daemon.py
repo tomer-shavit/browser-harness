@@ -293,3 +293,24 @@ def test_current_tab_meta_returns_not_attached_when_no_target_id():
     assert result == {"error": "not_attached"}
     # No CDP call should have been issued.
     assert d.cdp.calls == []
+
+
+def test_session_setup_stays_inside_the_helper_ipc_budget():
+    """_enable_default_domains runs on every switch_tab/new_tab and the helper's
+    IPC socket gives up at 5s. Every CDP call it makes must be concurrent, so the
+    worst case stays one round trip and not the sum of the timeouts."""
+    import ast
+    import inspect
+    import textwrap
+
+    from browser_harness import daemon
+
+    src = textwrap.dedent(inspect.getsource(daemon.Daemon._enable_default_domains))
+    body = ast.parse(src).body[0].body
+    awaited = [n for n in ast.walk(ast.Module(body=body, type_ignores=[])) if isinstance(n, ast.Await)]
+    top_level_awaits = [n for n in body if isinstance(n, ast.Expr) and isinstance(n.value, ast.Await)]
+
+    assert len(top_level_awaits) == 1, "more than one sequential await — timeouts now add up"
+    call = top_level_awaits[0].value.value
+    assert isinstance(call, ast.Call) and call.func.attr == "gather", "the single await must be a gather"
+    assert awaited, "sanity: the function should await something"

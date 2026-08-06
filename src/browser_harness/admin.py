@@ -492,9 +492,13 @@ def _launch_chrome(name, headless=True, chrome=None, window="1920,1080", args=No
     ]
     with open(d / "chrome.log", "w") as chrome_log:
         p = subprocess.Popen(argv, stdout=chrome_log, stderr=subprocess.STDOUT, **ipc.spawn_kwargs())
-    # "manual" marks a visible window a user is logging in through, so the reaper
-    # below never closes it out from under them.
-    (d / "chrome.pid").write_text(str(p.pid) if headless else f"{p.pid} manual")
+    # Line 1: pid, plus "manual" for a visible window a user is logging in
+    # through, so the reaper below never closes it out from under them.
+    # Line 2: start-time fingerprint, so a PID the OS later hands to an unrelated
+    # process is never mistaken for this browser and signalled.
+    (d / "chrome.pid").write_text(
+        f"{p.pid}{'' if headless else ' manual'}\n{_process_start_time(p.pid) or ''}\n"
+    )
     _reap_orphan_chromes(keep=name)
 
     deadline = time.time() + 30
@@ -509,6 +513,41 @@ def _launch_chrome(name, headless=True, chrome=None, window="1920,1080", args=No
     raise RuntimeError(f"Chrome didn't publish a debug port -- check {d / 'chrome.log'}")
 
 
+def _read_chrome_record(name=None):
+    """(pid, manual) for this profile's browser, or (None, manual).
+
+    pid is None unless the recorded start-time fingerprint still matches, so a
+    PID the OS has since handed to an unrelated process is never signalled."""
+    try:
+        lines = (background_profile_dir(name) / "chrome.pid").read_text().splitlines()
+        head = lines[0].split()
+        pid = int(head[0])
+    except (FileNotFoundError, ValueError, IndexError, OSError):
+        return None, False
+    manual = "manual" in head
+    recorded = lines[1].strip() if len(lines) > 1 else ""
+    if recorded and _process_start_time(pid) != recorded:
+        return None, manual
+    return pid, manual
+
+
+def _process_gone(pid):
+    """True when PID is no longer running.
+
+    Not os.kill(pid, 0): on Windows os.kill terminates the process for any signal
+    that is not a console event, so the POSIX "signal 0 asks, it does not kill"
+    idiom would silently be a kill."""
+    if os.name == "nt":
+        return _process_start_time(pid) is None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        pass
+    return False
+
+
 def _reap_orphan_chromes(keep=None):
     """Kill background Chromes whose daemon is gone.
 
@@ -519,36 +558,41 @@ def _reap_orphan_chromes(keep=None):
 
     Skips profiles marked "manual": a visible login window has no daemon by
     design, and closing it mid-login is exactly what the user did not ask for."""
+    if ipc.BH_RUNTIME_DIR and not ipc.BH_RUNTIME_DIR_SHARED:
+        # Daemons are one-per-runtime-dir here, so we cannot see anyone else's.
+        # Every other profile would look dead and get its live browser killed.
+        return
     for d in sorted(paths.home_dir().glob("chrome-*")):
         name = d.name[len("chrome-"):]
-        if not name or name == keep or not (d / "chrome.pid").exists():
+        if not name or name == keep:
             continue
-        try:
-            if "manual" in (d / "chrome.pid").read_text():
-                continue
-        except OSError:
-            continue
-        if daemon_alive(name):
+        pid, manual = _read_chrome_record(name)
+        if pid is None or manual or daemon_alive(name):
             continue
         _kill_chrome(name)
 
 
 def _kill_chrome(name=None):
-    """SIGTERM the Chrome we launched for this profile, if it's still up."""
+    """Stop the Chrome we launched for this profile, if it is still ours."""
     import signal
 
     f = background_profile_dir(name) / "chrome.pid"
-    try:
-        pid = int(f.read_text().split()[0])
-    except (FileNotFoundError, ValueError, IndexError, OSError):
+    pid, _ = _read_chrome_record(name)
+    if pid is None:
+        f.unlink(missing_ok=True)
         return
-    try:
-        os.kill(pid, signal.SIGTERM)
+    # SIGKILL fallback: without it a Chrome that ignores SIGTERM is orphaned
+    # forever, because the pid file it would be found by is deleted below.
+    for sig in (signal.SIGTERM, getattr(signal, "SIGKILL", signal.SIGTERM)):
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            break
         for _ in range(50):
-            os.kill(pid, 0)
+            if _process_gone(pid):
+                f.unlink(missing_ok=True)
+                return
             time.sleep(0.1)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
     f.unlink(missing_ok=True)
 
 

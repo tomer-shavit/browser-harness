@@ -458,8 +458,13 @@ class Daemon:
                 )
             except Exception as e:
                 log(f"enable {d} on {session_id}: {e}")
-        await asyncio.gather(*(enable_one(d) for d in ("Page", "DOM", "Runtime", "Network")))
-        await self.apply_ua(session_id)
+        # apply_ua joins the gather rather than following it: this path runs on
+        # every switch_tab/new_tab, and the helper's IPC socket gives up at 5s.
+        # Appending it sequentially would put the worst case at 7s.
+        await asyncio.gather(
+            *(enable_one(d) for d in ("Page", "DOM", "Runtime", "Network")),
+            self.apply_ua(session_id),
+        )
 
     async def apply_ua(self, session_id):
         """Headless Chrome announces itself as `HeadlessChrome/<v>` and plenty of
