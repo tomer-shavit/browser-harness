@@ -33,6 +33,8 @@ The harness runs its own headless Chrome on its own profile. No window, no Dock 
 
 Each agent session gets its own browser, so parallel agents cannot move each other's tab.
 
+A browser that goes 30 minutes with no command shuts itself down. The next call starts a fresh one on the same profile, still logged in; open tabs are gone. Set `BH_IDLE_TIMEOUT` (seconds, 0 disables) for a run that idles longer than that.
+
 That browser starts logged out of everything. To use a site that needs a login, name the browser and log in by hand once:
 
 ```bash

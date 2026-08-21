@@ -35,6 +35,15 @@ SOCK = ipc.sock_addr(NAME)
 LOG = str(ipc.log_path(NAME))
 PID = str(ipc.pid_path(NAME))
 BUF = 500
+# Seconds without work before the daemon exits, taking its Chrome with it.
+# Nothing else ends a session's browser: the daemon is detached and outlives the
+# agent that started it, so _reap_orphan_chromes -- which only kills a Chrome
+# whose daemon is gone -- never fires. Unchecked that reached 22 live browsers,
+# 594 processes and 12.8GB on one machine, and made the Dock's Chrome icon a
+# no-op (macOS activates a running headless instance instead of opening a
+# window). A later call just spawns a fresh daemon on the same profile, so a
+# timed-out browser costs a relaunch, never a login. 0 disables.
+IDLE_TIMEOUT = float(os.environ.get("BH_IDLE_TIMEOUT", 1800))
 _MAC_PROFILES = (
     "Library/Application Support/Google/Chrome",
     "Library/Application Support/Google/Chrome Canary",
@@ -379,6 +388,7 @@ class Daemon:
         self.dialog = None
         self.ua = None  # set when the browser reports a HeadlessChrome UA
         self.stop = None  # asyncio.Event, set inside start()
+        self.last_used = time.monotonic()  # refreshed by every request but ping
 
     async def attach_first_page(self):
         """Attach to a real page (or any page). Sets self.session. Returns attached target or None."""
@@ -541,6 +551,9 @@ class Daemon:
         # `pid` lets restart_daemon() verify the live daemon's identity before
         # signaling — protects against SIGTERM-by-stale-pid-file after PID reuse.
         if meta == "ping":        return {"pong": True, "pid": os.getpid(), "browser_kind": BROWSER_KIND}
+        # Below the ping: daemon_alive() probes must not keep an unused browser
+        # alive, or one session's launch sweep resets every other daemon's clock.
+        self.last_used = time.monotonic()
         if meta == "drain_events":
             out = list(self.events); self.events.clear()
             return {"events": out}
@@ -626,6 +639,20 @@ class Daemon:
             return {"error": msg}
 
 
+async def idle_watchdog(d):
+    """Stop the daemon once it has gone IDLE_TIMEOUT without work.
+
+    Exiting is the whole point: the __main__ finally calls stop_local_chrome(),
+    so the browser goes down with us."""
+    while True:
+        await asyncio.sleep(min(60, IDLE_TIMEOUT))
+        idle = time.monotonic() - d.last_used
+        if idle >= IDLE_TIMEOUT:
+            log(f"idle {idle:.0f}s -- shutting down")
+            d.stop.set()
+            return
+
+
 async def serve(d):
     async def handler(reader, writer):
         try:
@@ -646,13 +673,16 @@ async def serve(d):
 
     serve_task = asyncio.create_task(ipc.serve(NAME, handler))
     stop_task = asyncio.create_task(d.stop.wait())
+    tasks = [serve_task, stop_task]
+    if IDLE_TIMEOUT > 0:
+        tasks.append(asyncio.create_task(idle_watchdog(d)))
     await asyncio.sleep(0.05)  # let serve() bind so sock_addr() resolves to the live endpoint
     log(f"listening on {ipc.sock_addr(NAME)} (name={NAME}, remote={REMOTE_ID or 'local'})")
     try:
         await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
         if serve_task.done(): await serve_task  # surfaces a serve crash
     finally:
-        for t in (serve_task, stop_task):
+        for t in tasks:
             t.cancel()
             try: await t
             except (asyncio.CancelledError, Exception): pass

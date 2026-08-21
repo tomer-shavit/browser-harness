@@ -314,3 +314,61 @@ def test_session_setup_stays_inside_the_helper_ipc_budget():
     call = top_level_awaits[0].value.value
     assert isinstance(call, ast.Call) and call.func.attr == "gather", "the single await must be a gather"
     assert awaited, "sanity: the function should await something"
+
+
+def _idle_daemon():
+    """Daemon with the stop Event start() would have created."""
+    d = _fresh_daemon()
+    d.stop = asyncio.Event()
+    return d
+
+
+def test_idle_watchdog_stops_the_daemon_when_no_work_arrives(monkeypatch):
+    """Regression: the daemon is detached and outlived every session that
+    started one, so its Chrome was never released -- 22 live browsers and
+    12.8GB on one machine, and a Dock Chrome icon that opened nothing.
+    Exiting is what frees the browser: __main__'s finally stops it."""
+    monkeypatch.setattr(daemon, "IDLE_TIMEOUT", 0.2)
+
+    async def run():
+        d = _idle_daemon()
+        await asyncio.wait_for(daemon.idle_watchdog(d), timeout=2)
+        return d.stop.is_set()
+
+    assert asyncio.run(run())
+
+
+def test_work_refreshes_the_idle_clock(monkeypatch):
+    """A browser in active use must never be closed under its agent."""
+    monkeypatch.setattr(daemon, "IDLE_TIMEOUT", 0.5)
+
+    async def run():
+        d = _idle_daemon()
+        watchdog = asyncio.create_task(daemon.idle_watchdog(d))
+        for _ in range(12):  # 1.2s of work, well past the 0.5s timeout
+            await asyncio.sleep(0.1)
+            await d.handle({"meta": "session"})
+        still_up = not d.stop.is_set()
+        watchdog.cancel()
+        return still_up
+
+    assert asyncio.run(run())
+
+
+def test_ping_does_not_refresh_the_idle_clock(monkeypatch):
+    """daemon_alive() pings. If those counted as work, one session's launch
+    sweep would reset every other daemon's clock and nothing would ever
+    time out."""
+    monkeypatch.setattr(daemon, "IDLE_TIMEOUT", 0.3)
+
+    async def run():
+        d = _idle_daemon()
+        watchdog = asyncio.create_task(daemon.idle_watchdog(d))
+        for _ in range(10):
+            await asyncio.sleep(0.1)
+            await d.handle({"meta": "ping"})
+        stopped = d.stop.is_set()
+        watchdog.cancel()
+        return stopped
+
+    assert asyncio.run(run())

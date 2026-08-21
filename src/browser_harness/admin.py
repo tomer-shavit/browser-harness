@@ -551,10 +551,11 @@ def _process_gone(pid):
 def _reap_orphan_chromes(keep=None):
     """Kill background Chromes whose daemon is gone.
 
-    Names default to the agent's session, so a browser is left behind every time
-    a session ends without stopping its daemon -- and nothing else ever reaps
-    them. Unchecked this reached 9 browsers holding 3GB on one machine. Sweeping
-    at launch bounds the count by the sessions actually running.
+    The daemon's own IDLE_TIMEOUT is what normally ends a session's browser.
+    This sweep covers the case a timeout cannot: a daemon that crashed or was
+    killed, leaving its Chrome running with no one left to stop it. Names default
+    to the agent's session, so those orphans accumulate silently -- unchecked
+    this reached 9 browsers holding 3GB on one machine.
 
     Skips profiles marked "manual": a visible login window has no daemon by
     design, and closing it mid-login is exactly what the user did not ask for."""
