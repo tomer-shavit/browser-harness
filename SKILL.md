@@ -35,15 +35,7 @@ Each agent session gets its own browser, so parallel agents cannot move each oth
 
 A browser that goes 30 minutes with no command shuts itself down. The next call starts a fresh one on the same profile, still logged in; open tabs are gone. Set `BH_IDLE_TIMEOUT` (seconds, 0 disables) for a run that idles longer than that.
 
-That browser starts logged out of everything. To use a site that needs a login, name the browser and log in by hand once:
-
-```bash
-browser-harness <<'PY'
-login_background_profile("work")
-PY
-```
-
-A visible window opens. The user logs in, then closes it. Reach that profile from then on with `BU_NAME=work`, already signed in:
+That browser starts logged out of everything. For a site that needs a login, use the shared `work` browser. It holds the user's logins for GitHub, AWS and opyx:
 
 ```bash
 BU_NAME=work browser-harness <<'PY'
@@ -52,21 +44,27 @@ print(page_info())
 PY
 ```
 
-Stop a named browser when it is no longer needed: `stop_background_daemon("work")`.
+If `work` lands on a login page, copy the user's logins from their Chrome into it, then retry:
+
+```bash
+BU_NAME=work browser-harness <<< 'sync_chrome_logins()'
+```
+
+macOS shows a Keychain popup for "Chrome Safe Storage". Tell the user to click Allow, never Always Allow. Run it once, not in a loop. Only `WORK_LOGIN_DOMAINS` and their subdomains are copied; pass `domains=(...)` to add a site. If the user's Chrome is not signed in to the site either, ask the user to sign in there.
+
+`work` is shared: parallel agents on it share one tab. Stop it when done: `stop_background_daemon("work")`.
 
 ## The User's Own Browser
 
-Set `BU_ATTACH=1` to drive the browser the user is already using — their logins, their extensions, their tabs.
+Never the default. It pops Chrome's "Allow remote debugging?" dialog and raises Chrome over whatever the user is doing. Use it only when the user asks to watch, or after telling the user in chat why the task must be on their screen. Then set both `BH_VISIBLE=1` and `BU_ATTACH=1`; a hook denies `BU_ATTACH=1` without `BH_VISIBLE=1`.
 
 ```bash
-BU_ATTACH=1 browser-harness <<'PY'
+BH_VISIBLE=1 BU_ATTACH=1 browser-harness <<'PY'
 print(page_info())
 PY
 ```
 
-This takes focus: Chrome raises itself the moment a tab is created. Only use it when the task genuinely needs the user's live session, and say so first.
-
-In this mode Chrome needs remote debugging enabled. If the daemon cannot connect, run `browser-harness --doctor`. If Chrome is running but remote debugging is off, the harness opens `chrome://inspect/#remote-debugging` — ask the user to tick "Allow remote debugging for this browser instance", click Allow on the popup, then retry the same command.
+Finish the visible work in one stretch: each new connection pops the dialog again. If the dialog is not answered, ask once and stop; never retry in a loop. If the daemon cannot connect, run `browser-harness --doctor`.
 
 ## Remote Browsers
 
@@ -181,7 +179,7 @@ If you get stuck on a browser mechanic, check https://github.com/browser-use/bro
 ## Gotchas
 
 - Under `BU_ATTACH=1`, `chrome://inspect/#remote-debugging` must be enabled and Chrome may show an "Allow remote debugging?" popup; wait for the user to click Allow. Do not retry in a loop — Chrome pops a fresh dialog for every new connection, and the daemon's single held connection is what makes this a one-time click. The default headless browser needs none of this.
-- The default browser has no logins. A site that redirects to a sign-in page needs `login_background_profile(name)` once, not credentials typed from a screenshot.
+- The default browser has no logins. A site that needs one goes through `BU_NAME=work` and `sync_chrome_logins()`, never credentials typed from a screenshot.
 - Omnibox popups are not real work tabs.
 - CDP target order is not Chrome's visible tab-strip order.
 - `BU_CDP_URL` is an HTTP DevTools endpoint; the daemon resolves it to WebSocket.

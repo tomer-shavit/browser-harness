@@ -495,6 +495,77 @@ def http_get(url, headers=None, timeout=20.0):
         return data.decode()
 
 
+WORK_LOGIN_DOMAINS = ("github.com", "aws.amazon.com", "opyx.ai", "cloudflare.com", "posthog.com")
+
+
+def _work_login_cookie(host, name, domains):
+    if any(host.lstrip(".") == d or host.endswith("." + d) for d in domains):
+        return True
+    return host == ".amazon.com" and name.startswith(("aws", "noflush_aws"))
+
+
+def _decrypt_chrome_cookie(key, blob, strip_host_hash):
+    import ctypes
+    if not blob.startswith(b"v10"):
+        return None
+    data = blob[3:]
+    cc = ctypes.CDLL("/usr/lib/system/libcommonCrypto.dylib")
+    out = ctypes.create_string_buffer(len(data))
+    moved = ctypes.c_size_t()
+    rc = cc.CCCrypt(1, 0, 1, key, ctypes.c_size_t(16), b" " * 16, data, ctypes.c_size_t(len(data)),
+                    out, ctypes.c_size_t(len(data)), ctypes.byref(moved))
+    if rc != 0:
+        return None
+    plain = out.raw[:moved.value]
+    return (plain[32:] if strip_host_hash else plain).decode("utf-8", "replace")
+
+
+def sync_chrome_logins(domains=WORK_LOGIN_DOMAINS, chrome_profile=None):
+    """Copy the user's real-Chrome logins for `domains` (and subdomains) into this background browser.
+
+    Run it as `BU_NAME=work browser-harness <<< 'sync_chrome_logins()'`; the cookies persist in
+    that profile. macOS asks once per run for the "Chrome Safe Storage" key: the user clicks
+    Allow, never Always Allow. The key stays in memory. On ".amazon.com" only aws* cookies are
+    taken, so a retail Amazon session never leaves Chrome. macOS only."""
+    import hashlib, shutil, sqlite3, subprocess, tempfile
+    chrome_dir = Path.home() / "Library/Application Support/Google/Chrome"
+    if chrome_profile is None:
+        chrome_profile = json.loads((chrome_dir / "Local State").read_text())["profile"]["last_used"]
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "Cookies"
+        shutil.copy2(chrome_dir / chrome_profile / "Cookies", db)
+        con = sqlite3.connect(db)
+        version = int(con.execute("select value from meta where key='version'").fetchone()[0])
+        rows = con.execute(
+            "select host_key, name, encrypted_value, path, expires_utc, has_expires, is_secure, "
+            "is_httponly, samesite from cookies where top_frame_site_key = ''").fetchall()
+        con.close()
+    rows = [r for r in rows if _work_login_cookie(r[0], r[1], domains)]
+    if not rows:
+        return {"copied": 0, "domains": []}
+    password = subprocess.run(["security", "find-generic-password", "-w", "-s", "Chrome Safe Storage"],
+                              capture_output=True, check=True).stdout.strip()
+    key = hashlib.pbkdf2_hmac("sha1", password, b"saltysalt", 1003, 16)
+    same_site = {0: "None", 1: "Lax", 2: "Strict"}
+    cookies = []
+    for host, name, blob, path, expires, has_expires, secure, httponly, samesite in rows:
+        value = _decrypt_chrome_cookie(key, blob, strip_host_hash=version >= 24)
+        if value is None:
+            continue
+        c = {"name": name, "value": value, "path": path, "secure": bool(secure), "httpOnly": bool(httponly)}
+        if host.startswith("."):
+            c["domain"] = host
+        else:
+            c["url"] = f"https://{host}{path}"
+        if has_expires:
+            c["expires"] = expires / 1e6 - 11644473600
+        if samesite in same_site:
+            c["sameSite"] = same_site[samesite]
+        cookies.append(c)
+    cdp("Network.setCookies", cookies=cookies)
+    return {"copied": len(cookies), "domains": sorted({c.get("domain") or urlparse(c["url"]).hostname for c in cookies})}
+
+
 # Imported at the bottom so recorder's own `from . import helpers` sees a
 # fully-defined module. Exposes the recording helpers via `from .helpers import *`.
 from .recorder import start_recording, stop_recording, recording_dir

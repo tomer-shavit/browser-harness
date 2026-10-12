@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 import time
 from unittest.mock import patch
@@ -350,3 +351,47 @@ def test_wait_for_network_idle_filters_events_to_active_session():
         "session filter, the background rWS/lF pair would have updated "
         "last_activity and prevented the idle window from elapsing."
     )
+
+
+def _fake_chrome(home, cookies, password=b"pw"):
+    import hashlib, json as _json, sqlite3, subprocess
+    key = hashlib.pbkdf2_hmac("sha1", password, b"saltysalt", 1003, 16)
+    prof = home / "Library/Application Support/Google/Chrome/Profile 1"
+    prof.mkdir(parents=True)
+    (prof.parent / "Local State").write_text(_json.dumps({"profile": {"last_used": "Profile 1"}}))
+    con = sqlite3.connect(prof / "Cookies")
+    con.execute("create table meta (key, value)")
+    con.execute("insert into meta values ('version', '24')")
+    con.execute("create table cookies (host_key, name, value, encrypted_value, path, expires_utc, has_expires, "
+                "is_secure, is_httponly, samesite, top_frame_site_key)")
+    for host, name, value in cookies:
+        plain = hashlib.sha256(host.encode()).digest() + value.encode()
+        enc = subprocess.run(["openssl", "enc", "-aes-128-cbc", "-K", key.hex(), "-iv", "20" * 16],
+                             input=plain, capture_output=True, check=True).stdout
+        con.execute("insert into cookies values (?, ?, '', ?, '/', 13400000000000000, 1, 1, 1, 1, '')",
+                    (host, name, b"v10" + enc))
+    con.commit()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="CommonCrypto is macOS only")
+def test_sync_chrome_logins_copies_only_work_sites(tmp_path):
+    _fake_chrome(tmp_path, [
+        ("github.com", "user_session", "gh-secret"),
+        (".amazon.com", "aws-userInfo", "aws-secret"),
+        (".amazon.com", "session-token", "retail-secret"),
+        ("x.trycloudflare.com", "t", "tunnel"),
+        (".google.com", "SID", "google-secret"),
+        ("bo.il.opyx.ai", "__Secure-better-auth.session_token", "opyx-secret"),
+    ])
+    sent = []
+    keychain = type("R", (), {"stdout": b"pw\n"})()
+    with patch("pathlib.Path.home", return_value=tmp_path), \
+         patch("subprocess.run", return_value=keychain), \
+         patch("browser_harness.helpers.cdp", side_effect=lambda m, **p: sent.append(p["cookies"])):
+        helpers.sync_chrome_logins()
+    got = {(c.get("domain") or c["url"], c["name"], c["value"]) for c in sent[0]}
+    assert got == {
+        ("https://github.com/", "user_session", "gh-secret"),
+        (".amazon.com", "aws-userInfo", "aws-secret"),
+        ("https://bo.il.opyx.ai/", "__Secure-better-auth.session_token", "opyx-secret"),
+    }
