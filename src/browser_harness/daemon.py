@@ -386,6 +386,7 @@ class Daemon:
         self.target_id = None
         self.events = deque(maxlen=BUF)
         self.dialog = None
+        self.opened = []  # tabs this daemon created; closed on close_opened and on exit
         self.ua = None  # set when the browser reports a HeadlessChrome UA
         self.stop = None  # asyncio.Event, set inside start()
         self.last_used = time.monotonic()  # refreshed by every request but ping
@@ -538,6 +539,19 @@ class Daemon:
             return await orig(method, params, session_id)
         self.cdp._event_registry.handle_event = tap
 
+    async def close_opened(self):
+        closed = []
+        for tid in list(self.opened):
+            try:
+                await asyncio.wait_for(self.cdp.send_raw("Target.closeTarget", {"targetId": tid}), timeout=2)
+                closed.append(tid)
+            except Exception:
+                pass
+            self.opened.remove(tid)
+            if tid == self.target_id:
+                self.session = self.target_id = None
+        return closed
+
     async def handle(self, req):
         # Token guard for Windows TCP loopback: any local process can otherwise
         # connect and issue CDP commands. expected_token() is None on POSIX so
@@ -621,6 +635,7 @@ class Daemon:
             )))
             return {"session_id": self.session}
         if meta == "pending_dialog": return {"dialog": self.dialog}
+        if meta == "close_opened": return {"closed": await self.close_opened()}
         if meta == "shutdown":    self.stop.set(); return {"ok": True}
 
         method = req["method"]
@@ -629,7 +644,12 @@ class Daemon:
         # For everything else, explicit session in req wins; else default.
         sid = None if method.startswith("Target.") else (req.get("session_id") or self.session)
         try:
-            return {"result": await self.cdp.send_raw(method, params, session_id=sid)}
+            result = await self.cdp.send_raw(method, params, session_id=sid)
+            if method == "Target.createTarget" and result.get("targetId"):
+                self.opened.append(result["targetId"])
+            elif method == "Target.closeTarget" and params.get("targetId") in self.opened:
+                self.opened.remove(params["targetId"])
+            return {"result": result}
         except Exception as e:
             msg = str(e)
             if "Session with given id not found" in msg and sid == self.session and sid:
@@ -682,6 +702,7 @@ async def serve(d):
         await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
         if serve_task.done(): await serve_task  # surfaces a serve crash
     finally:
+        await _silent(d.close_opened())
         for t in tasks:
             t.cancel()
             try: await t

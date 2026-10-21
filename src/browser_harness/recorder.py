@@ -31,7 +31,7 @@ from . import paths
 ACTIONS = {
     "goto_url", "click_at_xy", "type_text", "fill_input", "press_key",
     "scroll", "dispatch_key", "upload_file", "new_tab", "switch_tab",
-    "close_tab", "ensure_real_tab",
+    "close_tab", "close_opened_tabs", "ensure_real_tab",
     "wait", "wait_for_load", "wait_for_element", "wait_for_network_idle",
 }
 

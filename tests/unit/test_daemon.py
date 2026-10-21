@@ -372,3 +372,21 @@ def test_ping_does_not_refresh_the_idle_clock(monkeypatch):
         return stopped
 
     assert asyncio.run(run())
+
+
+def test_close_opened_closes_only_tabs_the_daemon_created():
+    class CDP(_FakeCDP):
+        async def send_raw(self, method, params=None, session_id=None):
+            self.calls.append((method, params, session_id))
+            return {"targetId": "new-1"} if method == "Target.createTarget" else {}
+
+    d = daemon.Daemon()
+    d.cdp = CDP()
+    asyncio.run(d.handle({"method": "Target.createTarget", "params": {"url": "about:blank"}}))
+    d.target_id = "new-1"
+    closed = asyncio.run(d.handle({"meta": "close_opened"}))
+
+    assert closed == {"closed": ["new-1"]}
+    assert [p for (m, p, _s) in d.cdp.calls if m == "Target.closeTarget"] == [{"targetId": "new-1"}]
+    assert d.target_id is None
+    assert asyncio.run(d.handle({"meta": "close_opened"})) == {"closed": []}

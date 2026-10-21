@@ -338,6 +338,11 @@ def close_tab(target=None):
     cdp("Target.closeTarget", targetId=target_id)
 
 
+def close_opened_tabs():
+    """Close every tab this browser session opened. Call before you finish."""
+    return _send({"meta": "close_opened"})["closed"]
+
+
 def ensure_real_tab():
     """Switch to a real user tab if current is chrome:// / internal / stale."""
     tabs = list_tabs(include_chrome=False)

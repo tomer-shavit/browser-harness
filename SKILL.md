@@ -26,6 +26,7 @@ PY
 - Invoke as `browser-harness`. Use heredocs for multi-line commands.
 - Helpers are pre-imported. The daemon starts on the first call.
 - First navigation is `new_tab(url)`, not `goto_url(url)`.
+- Before you finish, call `close_opened_tabs()`. It closes every tab you opened. The daemon also closes them when it stops.
 
 ## The Browser
 
