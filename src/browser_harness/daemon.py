@@ -349,6 +349,9 @@ def is_inspect_tab(t):
     return t["type"] == "page" and t.get("url", "").startswith("chrome://inspect")
 
 
+MAX_OPENED_TABS = 4
+
+
 def harness_opened_inspect():
     """True when admin's recovery flow opened a chrome://inspect tab that is
     still awaiting cleanup (the marker survives until the next connect)."""
@@ -647,6 +650,10 @@ class Daemon:
             result = await self.cdp.send_raw(method, params, session_id=sid)
             if method == "Target.createTarget" and result.get("targetId"):
                 self.opened.append(result["targetId"])
+                excess = len(self.opened) - MAX_OPENED_TABS
+                for tid in [t for t in self.opened if t != self.target_id][:max(0, excess)]:
+                    await _silent(asyncio.wait_for(self.cdp.send_raw("Target.closeTarget", {"targetId": tid}), timeout=2))
+                    self.opened.remove(tid)
             elif method == "Target.closeTarget" and params.get("targetId") in self.opened:
                 self.opened.remove(params["targetId"])
             return {"result": result}

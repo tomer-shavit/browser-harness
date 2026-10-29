@@ -390,3 +390,25 @@ def test_close_opened_closes_only_tabs_the_daemon_created():
     assert [p for (m, p, _s) in d.cdp.calls if m == "Target.closeTarget"] == [{"targetId": "new-1"}]
     assert d.target_id is None
     assert asyncio.run(d.handle({"meta": "close_opened"})) == {"closed": []}
+
+
+def test_new_tab_past_the_cap_closes_the_oldest_tab_it_opened():
+    class CDP(_FakeCDP):
+        made = 0
+
+        async def send_raw(self, method, params=None, session_id=None):
+            self.calls.append((method, params, session_id))
+            if method == "Target.createTarget":
+                CDP.made += 1
+                return {"targetId": f"tab-{CDP.made}"}
+            return {}
+
+    d = daemon.Daemon()
+    d.cdp = CDP()
+    for _ in range(daemon.MAX_OPENED_TABS + 2):
+        asyncio.run(d.handle({"method": "Target.createTarget", "params": {"url": "about:blank"}}))
+        d.target_id = d.opened[-1]
+
+    closed = [p["targetId"] for (m, p, _s) in d.cdp.calls if m == "Target.closeTarget"]
+    assert closed == ["tab-1", "tab-2"]
+    assert d.opened == [f"tab-{n}" for n in range(3, daemon.MAX_OPENED_TABS + 3)]
