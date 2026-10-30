@@ -35,6 +35,15 @@ SOCK = ipc.sock_addr(NAME)
 LOG = str(ipc.log_path(NAME))
 PID = str(ipc.pid_path(NAME))
 BUF = 500
+# Seconds without work before the daemon exits, taking its Chrome with it.
+# Nothing else ends a session's browser: the daemon is detached and outlives the
+# agent that started it, so _reap_orphan_chromes -- which only kills a Chrome
+# whose daemon is gone -- never fires. Unchecked that reached 22 live browsers,
+# 594 processes and 12.8GB on one machine, and made the Dock's Chrome icon a
+# no-op (macOS activates a running headless instance instead of opening a
+# window). A later call just spawns a fresh daemon on the same profile, so a
+# timed-out browser costs a relaunch, never a login. 0 disables.
+IDLE_TIMEOUT = float(os.environ.get("BH_IDLE_TIMEOUT", 1800))
 _MAC_PROFILES = (
     "Library/Application Support/Google/Chrome",
     "Library/Application Support/Google/Chrome Canary",
@@ -340,6 +349,9 @@ def is_inspect_tab(t):
     return t["type"] == "page" and t.get("url", "").startswith("chrome://inspect")
 
 
+MAX_OPENED_TABS = 4
+
+
 def harness_opened_inspect():
     """True when admin's recovery flow opened a chrome://inspect tab that is
     still awaiting cleanup (the marker survives until the next connect)."""
@@ -377,8 +389,10 @@ class Daemon:
         self.target_id = None
         self.events = deque(maxlen=BUF)
         self.dialog = None
+        self.opened = []  # tabs this daemon created; closed on close_opened and on exit
         self.ua = None  # set when the browser reports a HeadlessChrome UA
         self.stop = None  # asyncio.Event, set inside start()
+        self.last_used = time.monotonic()  # refreshed by every request but ping
 
     async def attach_first_page(self):
         """Attach to a real page (or any page). Sets self.session. Returns attached target or None."""
@@ -528,6 +542,19 @@ class Daemon:
             return await orig(method, params, session_id)
         self.cdp._event_registry.handle_event = tap
 
+    async def close_opened(self):
+        closed = []
+        for tid in list(self.opened):
+            try:
+                await asyncio.wait_for(self.cdp.send_raw("Target.closeTarget", {"targetId": tid}), timeout=2)
+                closed.append(tid)
+            except Exception:
+                pass
+            self.opened.remove(tid)
+            if tid == self.target_id:
+                self.session = self.target_id = None
+        return closed
+
     async def handle(self, req):
         # Token guard for Windows TCP loopback: any local process can otherwise
         # connect and issue CDP commands. expected_token() is None on POSIX so
@@ -541,6 +568,9 @@ class Daemon:
         # `pid` lets restart_daemon() verify the live daemon's identity before
         # signaling — protects against SIGTERM-by-stale-pid-file after PID reuse.
         if meta == "ping":        return {"pong": True, "pid": os.getpid(), "browser_kind": BROWSER_KIND}
+        # Below the ping: daemon_alive() probes must not keep an unused browser
+        # alive, or one session's launch sweep resets every other daemon's clock.
+        self.last_used = time.monotonic()
         if meta == "drain_events":
             out = list(self.events); self.events.clear()
             return {"events": out}
@@ -608,6 +638,7 @@ class Daemon:
             )))
             return {"session_id": self.session}
         if meta == "pending_dialog": return {"dialog": self.dialog}
+        if meta == "close_opened": return {"closed": await self.close_opened()}
         if meta == "shutdown":    self.stop.set(); return {"ok": True}
 
         method = req["method"]
@@ -616,7 +647,16 @@ class Daemon:
         # For everything else, explicit session in req wins; else default.
         sid = None if method.startswith("Target.") else (req.get("session_id") or self.session)
         try:
-            return {"result": await self.cdp.send_raw(method, params, session_id=sid)}
+            result = await self.cdp.send_raw(method, params, session_id=sid)
+            if method == "Target.createTarget" and result.get("targetId"):
+                self.opened.append(result["targetId"])
+                excess = len(self.opened) - MAX_OPENED_TABS
+                for tid in [t for t in self.opened if t != self.target_id][:max(0, excess)]:
+                    await _silent(asyncio.wait_for(self.cdp.send_raw("Target.closeTarget", {"targetId": tid}), timeout=2))
+                    self.opened.remove(tid)
+            elif method == "Target.closeTarget" and params.get("targetId") in self.opened:
+                self.opened.remove(params["targetId"])
+            return {"result": result}
         except Exception as e:
             msg = str(e)
             if "Session with given id not found" in msg and sid == self.session and sid:
@@ -624,6 +664,20 @@ class Daemon:
                 if await self.attach_first_page():
                     return {"result": await self.cdp.send_raw(method, params, session_id=self.session)}
             return {"error": msg}
+
+
+async def idle_watchdog(d):
+    """Stop the daemon once it has gone IDLE_TIMEOUT without work.
+
+    Exiting is the whole point: the __main__ finally calls stop_local_chrome(),
+    so the browser goes down with us."""
+    while True:
+        await asyncio.sleep(min(60, IDLE_TIMEOUT))
+        idle = time.monotonic() - d.last_used
+        if idle >= IDLE_TIMEOUT:
+            log(f"idle {idle:.0f}s -- shutting down")
+            d.stop.set()
+            return
 
 
 async def serve(d):
@@ -646,13 +700,17 @@ async def serve(d):
 
     serve_task = asyncio.create_task(ipc.serve(NAME, handler))
     stop_task = asyncio.create_task(d.stop.wait())
+    tasks = [serve_task, stop_task]
+    if IDLE_TIMEOUT > 0:
+        tasks.append(asyncio.create_task(idle_watchdog(d)))
     await asyncio.sleep(0.05)  # let serve() bind so sock_addr() resolves to the live endpoint
     log(f"listening on {ipc.sock_addr(NAME)} (name={NAME}, remote={REMOTE_ID or 'local'})")
     try:
         await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
         if serve_task.done(): await serve_task  # surfaces a serve crash
     finally:
-        for t in (serve_task, stop_task):
+        await _silent(d.close_opened())
+        for t in tasks:
             t.cancel()
             try: await t
             except (asyncio.CancelledError, Exception): pass
